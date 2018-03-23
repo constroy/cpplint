@@ -48,6 +48,7 @@ import glob
 import itertools
 import math  # for log
 import os
+import pickle
 import re
 import sre_compile
 import string
@@ -634,6 +635,9 @@ _excludes = None
 
 # Whether to supress PrintInfo messages
 _quiet = False
+
+# Whether to use cached results from last check
+_incremental = False
 
 # The allowed line length of files.
 # This is set by --linelength flag.
@@ -1350,6 +1354,10 @@ class FileInfo(object):
   def IsSource(self):
     """File has a source file extension."""
     return _IsSourceExtension(self.Extension()[1:])
+
+  def ModificationTime(self):
+    """Time of last modification of file"""
+    return os.path.getmtime(self._filename)
 
 
 def _ShouldPrintError(category, confidence, linenum):
@@ -6197,8 +6205,15 @@ def ProcessConfigOverrides(filename):
 
   return True
 
+class ErrorInfo():
+  """Holds error information"""
+  def __init__(self, linenum, message, category, confidence):
+    self.linenum = linenum
+    self.message = message
+    self.category = category
+    self.confidence = confidence
 
-def ProcessFile(filename, vlevel, extra_check_functions=None):
+def ProcessFile(filename, vlevel, extra_check_functions=None, cached_result={}):
   """Does google-lint on a single file.
 
   Args:
@@ -6207,10 +6222,18 @@ def ProcessFile(filename, vlevel, extra_check_functions=None):
     vlevel: The level of errors to report.  Every error of confidence
     >= verbose_level will be reported.  0 is a good default.
 
+    cached_result: The result of last check cached on disk. This is used to
+                   avoid duplicated check.
+
     extra_check_functions: An array of additional check functions that will be
                            run on each source line. Each function takes 4
                            arguments: filename, clean_lines, line, error
   """
+
+  def ErrorWithCache(filename, linenum, category, confidence, message):
+    if _ShouldPrintError(category, confidence, linenum):
+      error_list.append(ErrorInfo(linenum, message, category, confidence))
+    Error(filename, linenum, category, confidence, message)
 
   _SetVerboseLevel(vlevel)
   _BackupFilters()
@@ -6219,6 +6242,18 @@ def ProcessFile(filename, vlevel, extra_check_functions=None):
     _RestoreFilters()
     return
 
+  mtime = FileInfo(filename).ModificationTime()
+  if (filename, mtime) in cached_result.keys():
+    for info in cached_result[(filename, mtime)]:
+      final_message = '%s:%s:  %s  [%s] [%d]\n' % (
+          filename, info.linenum, info.message, info.category, info.confidence)
+      sys.stderr.write(final_message)
+      _cpplint_state.IncrementErrorCount(info.category)
+    _cpplint_state.PrintInfo('Done processing %s\n' % filename)
+    _RestoreFilters()
+    return
+
+  error_list = []
   lf_lines = []
   crlf_lines = []
   try:
@@ -6261,7 +6296,7 @@ def ProcessFile(filename, vlevel, extra_check_functions=None):
     _cpplint_state.PrintError('Ignoring %s; not a valid file name '
                      '(%s)\n' % (filename, ', '.join(GetAllExtensions())))
   else:
-    ProcessFileData(filename, file_extension, lines, Error,
+    ProcessFileData(filename, file_extension, lines, ErrorWithCache,
                     extra_check_functions)
 
     # If end-of-line sequences are a mix of LF and CR-LF, issue
@@ -6279,9 +6314,10 @@ def ProcessFile(filename, vlevel, extra_check_functions=None):
       # check whether the file is mostly CRLF or just LF, and warn on the
       # minority, we bias toward LF here since most tools prefer LF.
       for linenum in crlf_lines:
-        Error(filename, linenum, 'whitespace/newline', 1,
+        ErrorWithCache(filename, linenum, 'whitespace/newline', 1,
               'Unexpected \\r (^M) found; better to use only \\n')
 
+  cached_result[(filename, mtime)] = error_list
   _cpplint_state.PrintInfo('Done processing %s\n' % filename)
   _RestoreFilters()
 
@@ -6331,7 +6367,8 @@ def ParseArguments(args):
                                                  'exclude=',
                                                  'headers=',
                                                  'quiet',
-                                                 'recursive'])
+                                                 'recursive',
+                                                 'incremental'])
   except getopt.GetoptError:
     PrintUsage('Invalid arguments.')
 
@@ -6393,6 +6430,9 @@ def ParseArguments(args):
     elif opt == '--quiet':
       global _quiet
       _quiet = True
+    elif opt == '--incremental':
+      global _incremental
+      _incremental = True
 
   if not filenames:
     PrintUsage('No files were specified.')
@@ -6457,10 +6497,19 @@ def main():
     # if we try to print something containing non-ASCII characters.
     sys.stderr = codecs.StreamReader(sys.stderr, 'replace')
 
+    cached_result = {}
+    if _incremental and os.path.isfile('./cpplint_cache.temp'):
+      with open("./cpplint_cache.temp", "rb") as f:
+        cached_result = pickle.load(f)
+
     _cpplint_state.ResetErrorCounts()
     for filename in filenames:
-      ProcessFile(filename, _cpplint_state.verbose_level)
+      ProcessFile(filename, _cpplint_state.verbose_level, cached_result=cached_result)
     _cpplint_state.PrintErrorCounts()
+
+    if _incremental:
+      with open("./cpplint_cache.temp", "wb") as f:
+        pickle.dump(cached_result, f)
 
     if _cpplint_state.output_format == 'junit':
       sys.stderr.write(_cpplint_state.FormatJUnitXML())
